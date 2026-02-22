@@ -1,0 +1,47 @@
+[
+  {
+    "id": "seoul_dense",
+    "name": "서울 등고선",
+    "asset": "assets/data/seoul_dense_overlay.json"
+  },
+  {
+    "id": "jeju_dense",
+    "name": "제주 등고선",
+    "asset": "assets/data/jeju_dense_overlay.json"
+  },
+  {
+    "id": "incheon_dense",
+    "name": "인천 등고선",
+    "asset": "assets/data/incheon_overlay.json"
+  },
+  {
+    "id": "sejong_dense",
+    "name": "세종 등고선",
+    "asset": "assets/data/sejong_overlay.json"
+  },
+  {
+    "id": "ulsan_dense",
+    "name": "울산 등고선",
+    "asset": "assets/data/ulsan_overlay.json"
+  },
+  {
+    "id": "chungbuk_dense",
+    "name": "충북 등고선",
+    "asset": "assets/data/chungbuk_overlay.json"
+  },
+  {
+    "id": "chungnam_dense",
+    "name": "충남 등고선",
+    "asset": "assets/data/chungnam_overlay.json"
+  },
+  {
+    "id": "jeonbuk_dense",
+    "name": "전북특별자치도 등고선",
+    "asset": "assets/data/jeonbuk_overlay.json"
+  },
+  {
+    "id": "jeonnam_dense",
+    "name": "전남 등고선",
+    "asset": "assets/data/jeonnam_overlay.json"
+  }
+]

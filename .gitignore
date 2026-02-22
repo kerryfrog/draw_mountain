@@ -1,0 +1,54 @@
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub/
+.pub-cache/
+build/
+coverage/
+doc/api/
+**/ios/Flutter/.last_build_id
+
+# IDE / Editor
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# OS / Temp
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.orig
+
+# Logs
+*.log
+
+# Python caches (scripts/)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Android / iOS local config
+android/local.properties
+android/key.properties
+*.jks
+*.keystore
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/ephemeral/
+ios/Flutter/Generated.xcconfig
+ios/Flutter/flutter_export_environment.sh
+
+# Desktop ephemeral Flutter build dirs
+macos/Flutter/ephemeral/
+linux/flutter/ephemeral/
+windows/flutter/ephemeral/
+
+# Optional local GIS source data (large, regenerated)
+contours/
+test_data/
