@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:file_selector/file_selector.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart' show RenderRepaintBoundary;
 import 'package:gal/gal.dart';
@@ -13,6 +14,8 @@ import 'contour_source_loader.dart';
 import 'gpx_route_loader.dart';
 
 enum MapDecorationType { title, northArrow, legend }
+
+String _decorationLayerId(MapDecorationType type) => 'decoration:${type.name}';
 
 void main() {
   runApp(const ContourRouteApp());
@@ -25,6 +28,7 @@ class ContourRouteApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Contour + GPX Route',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1D6B52)),
       ),
@@ -43,6 +47,9 @@ class ContourRoutePage extends StatefulWidget {
 class _ContourRoutePageState extends State<ContourRoutePage> {
   static const double _minMapScale = 0.2;
   static const double _maxMapScale = 48.0;
+  static const double _layerPanelWidth = 210;
+  static const double _layerPanelMargin = 12;
+  static const double _layerPanelHandleHeight = 40;
 
   static const _trackPalette = <Color>[
     Color(0xFFE74B3C),
@@ -61,6 +68,15 @@ class _ContourRoutePageState extends State<ContourRoutePage> {
     Color(0xFFD2691E),
     Color(0xFF7B5EA7),
   ];
+  static const _titleFontOptions = <MapEntry<String, String>>[
+    MapEntry('Noto Sans KR', 'Noto Sans KR'),
+    MapEntry('Gothic A1', 'Gothic A1'),
+    MapEntry('Nanum Pen Script', 'Nanum Pen Script'),
+    MapEntry('Nanum Myeongjo', 'Nanum Myeongjo'),
+  ];
+  static const Color _defaultContourColor = Color(0xFF4B6256);
+  static const double _defaultContourWidth = 2.2;
+  static const double _defaultContourOpacity = 0.5;
 
   late final Future<OverlayData> _baseDataFuture;
   final TransformationController _mapTransformController =
@@ -75,13 +91,46 @@ class _ContourRoutePageState extends State<ContourRoutePage> {
   bool _isLoadingContourLayer = false;
   bool _isExportingImage = false;
   bool _isLayerPanelVisible = true;
+  bool _isAddingTrackNote = false;
   bool _showTitleDecoration = false;
   bool _showNorthArrowDecoration = false;
   bool _showLegendDecoration = false;
   String _mapTitle = '나의 트랙';
+  Color _titleColor = const Color(0xFF1F2A24);
+  double _titleFontSize = 28;
+  String _titleFontFamily = 'Noto Sans KR';
+  Offset? _layerPanelOffset;
   String? _statusMessage;
   String _selectedLayerId = '';
+  String? _draggingTrackId;
+  String? _draggingTrackNoteId;
+  _TrackNoteDragTarget? _draggingTrackNoteTarget;
+  Offset? _draggingLabelGrabDeltaWorld;
+  String? _moveReadyTrackId;
+  String? _moveReadyTrackNoteId;
+  bool _isTrackNoteModalOpen = false;
   int _trackSerial = 0;
+
+  String _resolvedTrackNoteFontFamily() {
+    for (final option in _titleFontOptions) {
+      if (option.value == _titleFontFamily) {
+        return _titleFontFamily;
+      }
+    }
+    return 'Noto Sans KR';
+  }
+
+  void _clearTrackNoteDragState() {
+    _draggingTrackId = null;
+    _draggingTrackNoteId = null;
+    _draggingTrackNoteTarget = null;
+    _draggingLabelGrabDeltaWorld = null;
+  }
+
+  void _clearTrackNoteMoveReady() {
+    _moveReadyTrackId = null;
+    _moveReadyTrackNoteId = null;
+  }
 
   @override
   void initState() {
@@ -170,6 +219,9 @@ class _ContourRoutePageState extends State<ContourRoutePage> {
       setState(() {
         _tracks.add(layer);
         _selectedLayerId = layer.id;
+        _isAddingTrackNote = false;
+        _clearTrackNoteDragState();
+        _clearTrackNoteMoveReady();
         _statusMessage = '루트 로드 완료: ${file.name}';
       });
     } catch (error) {
@@ -192,6 +244,13 @@ class _ContourRoutePageState extends State<ContourRoutePage> {
         return;
       }
       _tracks[idx] = _tracks[idx].copyWith(visible: visible);
+      if (!visible && _selectedLayerId == trackId) {
+        _isAddingTrackNote = false;
+        _clearTrackNoteDragState();
+        _clearTrackNoteMoveReady();
+      } else if (!visible && _moveReadyTrackId == trackId) {
+        _clearTrackNoteMoveReady();
+      }
     });
   }
 
@@ -226,10 +285,66 @@ class _ContourRoutePageState extends State<ContourRoutePage> {
         return;
       }
       final removed = _tracks.removeAt(idx);
+      if (_moveReadyTrackId == trackId) {
+        _clearTrackNoteMoveReady();
+      }
+      if (_draggingTrackId == trackId) {
+        _clearTrackNoteDragState();
+      }
       if (_selectedLayerId == trackId) {
         _selectedLayerId = '';
+        _isAddingTrackNote = false;
+        _clearTrackNoteDragState();
+        _clearTrackNoteMoveReady();
       }
       _statusMessage = '트랙 삭제: ${removed.name}';
+    });
+  }
+
+  void _setTrackNoteVisible(String trackId, String noteId, bool visible) {
+    setState(() {
+      final trackIdx = _tracks.indexWhere((track) => track.id == trackId);
+      if (trackIdx == -1) {
+        return;
+      }
+      final track = _tracks[trackIdx];
+      final notes = track.notes
+          .map((note) => note.id == noteId ? note.copyWith(visible: visible) : note)
+          .toList(growable: false);
+      _tracks[trackIdx] = track.copyWith(notes: notes);
+      if (!visible &&
+          _draggingTrackId == trackId &&
+          _draggingTrackNoteId == noteId) {
+        _clearTrackNoteDragState();
+      }
+      if (!visible &&
+          _moveReadyTrackId == trackId &&
+          _moveReadyTrackNoteId == noteId) {
+        _clearTrackNoteMoveReady();
+      }
+    });
+  }
+
+  void _removeTrackNote(String trackId, String noteId) {
+    setState(() {
+      final trackIdx = _tracks.indexWhere((track) => track.id == trackId);
+      if (trackIdx == -1) {
+        return;
+      }
+      final track = _tracks[trackIdx];
+      final removed = track.notes.where((note) => note.id == noteId);
+      final removedLabel = removed.isEmpty ? '포인트' : removed.first.text;
+      final notes = track.notes
+          .where((note) => note.id != noteId)
+          .toList(growable: false);
+      _tracks[trackIdx] = track.copyWith(notes: notes);
+      if (_draggingTrackId == trackId && _draggingTrackNoteId == noteId) {
+        _clearTrackNoteDragState();
+      }
+      if (_moveReadyTrackId == trackId && _moveReadyTrackNoteId == noteId) {
+        _clearTrackNoteMoveReady();
+      }
+      _statusMessage = '포인트 삭제: $removedLabel';
     });
   }
 
@@ -242,36 +357,714 @@ class _ContourRoutePageState extends State<ContourRoutePage> {
     return null;
   }
 
+  ContourLayer? _selectedContourLayer() {
+    for (final layer in _contourLayers) {
+      if (layer.id == _selectedLayerId) {
+        return layer;
+      }
+    }
+    return null;
+  }
+
+  ContourLayer? _selectedVisibleContourLayer() {
+    for (final layer in _contourLayers) {
+      if (layer.id == _selectedLayerId && layer.visible) {
+        return layer;
+      }
+    }
+    return null;
+  }
+
+  ContourLayer? _firstVisibleContourLayer() {
+    for (final layer in _contourLayers) {
+      if (layer.visible) {
+        return layer;
+      }
+    }
+    return null;
+  }
+
+  _LegendIntervals _legendIntervals() {
+    final layer = _selectedVisibleContourLayer() ?? _firstVisibleContourLayer();
+    if (layer == null || layer.contours.isEmpty) {
+      return const _LegendIntervals(majorInterval: 100, minorInterval: 20);
+    }
+
+    final majorElevations = layer.contours
+        .where((contour) => contour.major)
+        .map((contour) => contour.elevation.abs())
+        .toSet()
+        .toList()
+      ..sort();
+    final minorElevations = layer.contours
+        .where((contour) => !contour.major)
+        .map((contour) => contour.elevation.abs())
+        .toSet()
+        .toList()
+      ..sort();
+    final allElevations = layer.contours
+        .map((contour) => contour.elevation.abs())
+        .toSet()
+        .toList()
+      ..sort();
+
+    final majorInterval = _minPositiveStep(majorElevations) ?? 100;
+    final minorFromMinor = _minPositiveStep(minorElevations);
+    final minorFromAll = _minPositiveStep(allElevations);
+
+    final minorInterval = minorFromMinor ??
+        ((minorFromAll != null && minorFromAll < majorInterval)
+            ? minorFromAll
+            : (majorInterval >= 100 ? 20 : 10));
+
+    return _LegendIntervals(
+      majorInterval: majorInterval,
+      minorInterval: minorInterval,
+    );
+  }
+
+  int? _minPositiveStep(List<int> sortedValues) {
+    if (sortedValues.length < 2) {
+      return null;
+    }
+    var best = 1 << 30;
+    for (var i = 1; i < sortedValues.length; i++) {
+      final diff = sortedValues[i] - sortedValues[i - 1];
+      if (diff > 0 && diff < best) {
+        best = diff;
+      }
+    }
+    if (best == (1 << 30)) {
+      return null;
+    }
+    return best;
+  }
+
   void _updateSelectedColor(Color color) {
-    final selected = _selectedTrack();
-    if (selected == null) {
+    final selectedTrack = _selectedTrack();
+    if (selectedTrack != null) {
+      setState(() {
+        final idx = _tracks.indexWhere((track) => track.id == selectedTrack.id);
+        _tracks[idx] = selectedTrack.copyWith(color: color);
+      });
       return;
     }
-    setState(() {
-      final idx = _tracks.indexWhere((track) => track.id == selected.id);
-      _tracks[idx] = selected.copyWith(color: color);
-    });
+    final selectedContour = _selectedContourLayer();
+    if (selectedContour != null) {
+      setState(() {
+        final idx = _contourLayers.indexWhere(
+          (layer) => layer.id == selectedContour.id,
+        );
+        _contourLayers[idx] = selectedContour.copyWith(color: color);
+      });
+    }
   }
 
   void _updateSelectedWidth(double width) {
-    final selected = _selectedTrack();
-    if (selected == null) {
+    final selectedTrack = _selectedTrack();
+    if (selectedTrack != null) {
+      setState(() {
+        final idx = _tracks.indexWhere((track) => track.id == selectedTrack.id);
+        _tracks[idx] = selectedTrack.copyWith(width: width);
+      });
       return;
     }
-    setState(() {
-      final idx = _tracks.indexWhere((track) => track.id == selected.id);
-      _tracks[idx] = selected.copyWith(width: width);
-    });
+    final selectedContour = _selectedContourLayer();
+    if (selectedContour != null) {
+      setState(() {
+        final idx = _contourLayers.indexWhere(
+          (layer) => layer.id == selectedContour.id,
+        );
+        _contourLayers[idx] = selectedContour.copyWith(width: width);
+      });
+    }
   }
 
   void _updateSelectedOpacity(double opacity) {
-    final selected = _selectedTrack();
-    if (selected == null) {
+    final selectedTrack = _selectedTrack();
+    if (selectedTrack != null) {
+      setState(() {
+        final idx = _tracks.indexWhere((track) => track.id == selectedTrack.id);
+        _tracks[idx] = selectedTrack.copyWith(opacity: opacity);
+      });
+      return;
+    }
+    final selectedContour = _selectedContourLayer();
+    if (selectedContour != null) {
+      setState(() {
+        final idx = _contourLayers.indexWhere(
+          (layer) => layer.id == selectedContour.id,
+        );
+        _contourLayers[idx] = selectedContour.copyWith(opacity: opacity);
+      });
+    }
+  }
+
+  void _updateTitleColor(Color color) {
+    setState(() {
+      _titleColor = color;
+    });
+  }
+
+  void _updateTitleFontSize(double size) {
+    setState(() {
+      _titleFontSize = size;
+    });
+  }
+
+  void _toggleTrackNoteMode() {
+    final selectedTrack = _selectedTrack();
+    if (selectedTrack == null) {
+      setState(() {
+        _statusMessage = '레이어에서 GPX 트랙을 먼저 선택해 주세요.';
+      });
       return;
     }
     setState(() {
-      final idx = _tracks.indexWhere((track) => track.id == selected.id);
-      _tracks[idx] = selected.copyWith(opacity: opacity);
+      _isAddingTrackNote = !_isAddingTrackNote;
+      if (!_isAddingTrackNote) {
+        _clearTrackNoteDragState();
+        _clearTrackNoteMoveReady();
+      }
+      _statusMessage = _isAddingTrackNote
+          ? '경로 편집 모드 ON: 포인트 추가/수정/삭제 가능, 텍스트 이동은 메뉴에서 실행'
+          : '경로 편집 모드 OFF';
+    });
+  }
+
+  Future<void> _handleMapTapForTrackNote({
+    required Offset tapLocalPosition,
+    required Size canvasSize,
+    required Rect worldBounds,
+  }) async {
+    if (!_isAddingTrackNote || _isTrackNoteModalOpen) {
+      return;
+    }
+    try {
+      final selectedTrack = _selectedTrack();
+      if (selectedTrack == null || !selectedTrack.visible) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _isAddingTrackNote = false;
+          _clearTrackNoteDragState();
+          _clearTrackNoteMoveReady();
+          _statusMessage = '보이는 GPX 트랙을 선택한 뒤 다시 시도해 주세요.';
+        });
+        return;
+      }
+
+      final canvasTap = _mapTransformController.toScene(tapLocalPosition);
+      final projector = _Projector(world: worldBounds, canvasSize: canvasSize);
+      final nearestNote = _findNearestTrackNoteOnCanvas(
+        track: selectedTrack,
+        canvasTap: canvasTap,
+        projector: projector,
+      );
+      final noteHitThreshold = nearestNote?.hitTarget == _TrackNoteHitTarget.label
+          ? 16.0
+          : 24.0;
+      if (nearestNote != null && nearestNote.distancePx <= noteHitThreshold) {
+        final action = await _showTrackNoteActionSheet(nearestNote.note.text);
+        if (!mounted || action == null) {
+          return;
+        }
+        if (action == _TrackNoteAction.moveText) {
+          setState(() {
+            _moveReadyTrackId = selectedTrack.id;
+            _moveReadyTrackNoteId = nearestNote.note.id;
+            _statusMessage = '텍스트 이동 대기: 라벨을 드래그하세요.';
+          });
+          return;
+        }
+        setState(_clearTrackNoteMoveReady);
+        if (action == _TrackNoteAction.delete) {
+          _removeTrackNote(selectedTrack.id, nearestNote.note.id);
+          return;
+        }
+
+        final edited = await _promptTrackNoteText(
+          title: '포인트 메모 수정',
+          initialValue: nearestNote.note.text,
+        );
+        if (!mounted || edited == null) {
+          return;
+        }
+        final trimmedEdited = edited.trim();
+        if (trimmedEdited.isEmpty) {
+          return;
+        }
+        setState(() {
+          final idx = _tracks.indexWhere(
+            (track) => track.id == selectedTrack.id,
+          );
+          if (idx == -1) {
+            return;
+          }
+          final notes = _tracks[idx].notes
+              .map(
+                (note) => note.id == nearestNote.note.id
+                    ? note.copyWith(text: trimmedEdited)
+                    : note,
+              )
+              .toList(growable: false);
+          _tracks[idx] = _tracks[idx].copyWith(notes: notes);
+          _statusMessage = '포인트 메모 수정: $trimmedEdited';
+        });
+        return;
+      }
+
+      if (_moveReadyTrackId == selectedTrack.id &&
+          _moveReadyTrackNoteId != null) {
+        setState(() {
+          _statusMessage = '텍스트 이동 대기 중: 선택한 라벨을 드래그하세요.';
+        });
+        return;
+      }
+
+      final nearestOnTrack = _findNearestTrackPointOnCanvas(
+        track: selectedTrack,
+        canvasTap: canvasTap,
+        projector: projector,
+      );
+
+      if (nearestOnTrack == null || nearestOnTrack.distancePx > 24) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _statusMessage = '트랙 선 또는 기존 포인트를 탭해 주세요.';
+        });
+        return;
+      }
+
+      final memo = await _promptTrackNoteText(
+        title: '포인트 메모 추가',
+        initialValue: '',
+      );
+      if (!mounted || memo == null) {
+        return;
+      }
+      final trimmedMemo = memo.trim();
+      if (trimmedMemo.isEmpty) {
+        return;
+      }
+
+      setState(() {
+        final idx = _tracks.indexWhere((track) => track.id == selectedTrack.id);
+        if (idx == -1) {
+          return;
+        }
+        final defaultLabelOffset = _defaultTrackNoteLabelOffset(projector);
+        final notes = List<TrackNote>.from(_tracks[idx].notes)
+          ..add(
+            TrackNote(
+              id: 'note_${DateTime.now().microsecondsSinceEpoch}',
+              point: nearestOnTrack.worldPoint,
+              text: trimmedMemo,
+              labelOffset: defaultLabelOffset,
+            ),
+          );
+        _tracks[idx] = _tracks[idx].copyWith(
+          notes: List<TrackNote>.unmodifiable(notes),
+        );
+        _statusMessage = '포인트 추가: $trimmedMemo';
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _statusMessage = '포인트 편집 오류: $error';
+      });
+    }
+  }
+
+  _NearestTrackPoint? _findNearestTrackPointOnCanvas({
+    required TrackLayer track,
+    required Offset canvasTap,
+    required _Projector projector,
+  }) {
+    _NearestTrackPoint? nearest;
+    var bestDistSquared = double.infinity;
+
+    for (final line in track.lines) {
+      for (var i = 1; i < line.length; i++) {
+        final aWorld = line[i - 1];
+        final bWorld = line[i];
+        final aCanvas = projector.toCanvas(aWorld);
+        final bCanvas = projector.toCanvas(bWorld);
+        final t = _segmentProjectionFactor(
+          point: canvasTap,
+          start: aCanvas,
+          end: bCanvas,
+        );
+        final closestCanvas = aCanvas + (bCanvas - aCanvas) * t;
+        final distSquared = (closestCanvas - canvasTap).distanceSquared;
+        if (distSquared < bestDistSquared) {
+          bestDistSquared = distSquared;
+          final closestWorld = aWorld + (bWorld - aWorld) * t;
+          nearest = _NearestTrackPoint(
+            worldPoint: closestWorld,
+            distancePx: math.sqrt(distSquared),
+          );
+        }
+      }
+    }
+
+    return nearest;
+  }
+
+  _NearestTrackNote? _findNearestTrackNoteOnCanvas({
+    required TrackLayer track,
+    required Offset canvasTap,
+    required _Projector projector,
+  }) {
+    _NearestTrackNote? nearest;
+    var bestDistance = double.infinity;
+    for (final note in track.notes) {
+      if (!note.isVisible) {
+        continue;
+      }
+      final noteCanvas = projector.toCanvas(note.point);
+      final markerDistance = (noteCanvas - canvasTap).distance;
+      if (markerDistance < bestDistance) {
+        bestDistance = markerDistance;
+        nearest = _NearestTrackNote(
+          note: note,
+          distancePx: markerDistance,
+          hitTarget: _TrackNoteHitTarget.marker,
+        );
+      }
+      final labelLayout = _buildTrackNoteLabelLayout(
+        note: note,
+        projector: projector,
+        fontFamily: _resolvedTrackNoteFontFamily(),
+      );
+      final labelHitRect = labelLayout.rect.inflate(12);
+      final labelDistance = _distanceFromPointToRect(canvasTap, labelHitRect);
+      if (labelDistance < bestDistance) {
+        bestDistance = labelDistance;
+        nearest = _NearestTrackNote(
+          note: note,
+          distancePx: labelDistance,
+          hitTarget: _TrackNoteHitTarget.label,
+        );
+      }
+    }
+    return nearest;
+  }
+
+  void _handleMapPanStartForTrackNote({
+    required Offset localPosition,
+    required Size canvasSize,
+    required Rect worldBounds,
+  }) {
+    if (!_isAddingTrackNote || _isTrackNoteModalOpen) {
+      return;
+    }
+    final selectedTrack = _selectedTrack();
+    if (selectedTrack == null || !selectedTrack.visible) {
+      return;
+    }
+    final moveReadyTrackId = _moveReadyTrackId;
+    final moveReadyNoteId = _moveReadyTrackNoteId;
+    if (moveReadyTrackId != selectedTrack.id || moveReadyNoteId == null) {
+      return;
+    }
+
+    final canvasPoint = _mapTransformController.toScene(localPosition);
+    final projector = _Projector(world: worldBounds, canvasSize: canvasSize);
+    final noteIdx = selectedTrack.notes.indexWhere(
+      (note) => note.id == moveReadyNoteId && note.isVisible,
+    );
+    if (noteIdx == -1) {
+      return;
+    }
+    final targetNote = selectedTrack.notes[noteIdx];
+    final labelLayout = _buildTrackNoteLabelLayout(
+      note: targetNote,
+      projector: projector,
+      fontFamily: _resolvedTrackNoteFontFamily(),
+    );
+    final labelHitRect = labelLayout.rect.inflate(16);
+    final labelDistance = _distanceFromPointToRect(canvasPoint, labelHitRect);
+    if (labelDistance > 20) {
+      return;
+    }
+
+    setState(() {
+      _draggingTrackId = selectedTrack.id;
+      _draggingTrackNoteId = targetNote.id;
+      _draggingTrackNoteTarget = _TrackNoteDragTarget.label;
+      final pointerWorld = projector.toWorld(canvasPoint);
+      final labelCenterWorld = targetNote.point + targetNote.labelOffset;
+      _draggingLabelGrabDeltaWorld = labelCenterWorld - pointerWorld;
+      _statusMessage = '텍스트 위치 이동 중...';
+    });
+  }
+
+  void _handleMapPanUpdateForTrackNote({
+    required Offset localPosition,
+    required Size canvasSize,
+    required Rect worldBounds,
+  }) {
+    if (!_isAddingTrackNote || _isTrackNoteModalOpen) {
+      return;
+    }
+    final draggingTrackId = _draggingTrackId;
+    final draggingNoteId = _draggingTrackNoteId;
+    final draggingTarget = _draggingTrackNoteTarget;
+    if (draggingTrackId == null ||
+        draggingNoteId == null ||
+        draggingTarget != _TrackNoteDragTarget.label) {
+      return;
+    }
+    final trackIdx = _tracks.indexWhere((track) => track.id == draggingTrackId);
+    if (trackIdx == -1) {
+      return;
+    }
+    final track = _tracks[trackIdx];
+    final canvasPoint = _mapTransformController.toScene(localPosition);
+    final projector = _Projector(world: worldBounds, canvasSize: canvasSize);
+    final noteIdx = track.notes.indexWhere((note) => note.id == draggingNoteId);
+    if (noteIdx == -1) {
+      return;
+    }
+    final currentNote = track.notes[noteIdx];
+    final pointerWorld = projector.toWorld(canvasPoint);
+    final grabDelta = _draggingLabelGrabDeltaWorld ?? Offset.zero;
+    final labelCenterWorld = pointerWorld + grabDelta;
+    final nextLabelOffset = labelCenterWorld - currentNote.point;
+    setState(() {
+      final notes = track.notes
+          .map(
+            (note) => note.id == draggingNoteId
+                ? note.copyWith(labelOffset: nextLabelOffset)
+                : note,
+          )
+          .toList(growable: false);
+      _tracks[trackIdx] = track.copyWith(notes: notes);
+    });
+  }
+
+  void _handleMapPanEndForTrackNote() {
+    if (_draggingTrackNoteId == null) {
+      return;
+    }
+    final finishedTarget = _draggingTrackNoteTarget;
+    setState(() {
+      _clearTrackNoteDragState();
+      _clearTrackNoteMoveReady();
+      _statusMessage = finishedTarget == _TrackNoteDragTarget.label
+          ? '텍스트 위치 이동 완료'
+          : '경로 지점은 고정입니다';
+    });
+  }
+
+  Offset _defaultTrackNoteLabelOffset(_Projector projector) {
+    final scale = math.max(projector.scale, 0.0001);
+    return Offset(36 / scale, 16 / scale);
+  }
+
+  double _distanceFromPointToRect(Offset point, Rect rect) {
+    final dx = point.dx < rect.left
+        ? rect.left - point.dx
+        : (point.dx > rect.right ? point.dx - rect.right : 0.0);
+    final dy = point.dy < rect.top
+        ? rect.top - point.dy
+        : (point.dy > rect.bottom ? point.dy - rect.bottom : 0.0);
+    return math.sqrt(dx * dx + dy * dy);
+  }
+
+  double _segmentProjectionFactor({
+    required Offset point,
+    required Offset start,
+    required Offset end,
+  }) {
+    final segment = end - start;
+    final segLengthSquared =
+        segment.dx * segment.dx + segment.dy * segment.dy;
+    if (segLengthSquared <= 0) {
+      return 0;
+    }
+    final fromStart = point - start;
+    final dot = fromStart.dx * segment.dx + fromStart.dy * segment.dy;
+    return (dot / segLengthSquared).clamp(0.0, 1.0).toDouble();
+  }
+
+  Future<String?> _promptTrackNoteText({
+    required String title,
+    required String initialValue,
+  }) async {
+    if (_isTrackNoteModalOpen || !mounted) {
+      return null;
+    }
+    _isTrackNoteModalOpen = true;
+    var draft = initialValue;
+    try {
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted) {
+        return null;
+      }
+      final memo = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) {
+          return AlertDialog(
+            title: Text(title),
+            content: TextFormField(
+              initialValue: initialValue,
+              autofocus: true,
+              maxLength: 28,
+              textInputAction: TextInputAction.done,
+              decoration: const InputDecoration(hintText: '예: 산입구'),
+              onChanged: (value) => draft = value,
+              onFieldSubmitted: (value) => Navigator.of(dialogContext).pop(value),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(),
+                child: const Text('취소'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(dialogContext).pop(draft),
+                child: const Text('저장'),
+              ),
+            ],
+          );
+        },
+      );
+      return memo;
+    } finally {
+      _isTrackNoteModalOpen = false;
+    }
+  }
+
+  Future<_TrackNoteAction?> _showTrackNoteActionSheet(String noteText) async {
+    if (_isTrackNoteModalOpen || !mounted) {
+      return null;
+    }
+    _isTrackNoteModalOpen = true;
+    try {
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted) {
+        return null;
+      }
+      return showModalBottomSheet<_TrackNoteAction>(
+        context: context,
+        showDragHandle: true,
+        useSafeArea: true,
+        builder: (sheetContext) {
+          return Wrap(
+            children: [
+              ListTile(
+                dense: true,
+                title: Text(
+                  noteText,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                subtitle: const Text('포인트 옵션'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.edit_outlined),
+                title: const Text('텍스트 수정'),
+                onTap: () =>
+                    Navigator.of(sheetContext).pop(_TrackNoteAction.edit),
+              ),
+              ListTile(
+                leading: const Icon(Icons.open_with),
+                title: const Text('텍스트 이동'),
+                onTap: () =>
+                    Navigator.of(sheetContext).pop(_TrackNoteAction.moveText),
+              ),
+              ListTile(
+                leading: const Icon(Icons.delete_outline),
+                title: const Text('포인트 삭제'),
+                onTap: () =>
+                    Navigator.of(sheetContext).pop(_TrackNoteAction.delete),
+              ),
+            ],
+          );
+        },
+      );
+    } finally {
+      _isTrackNoteModalOpen = false;
+    }
+  }
+
+  Future<void> _showTitleFontPicker() async {
+    final pickedFamily = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      useSafeArea: true,
+      isScrollControlled: true,
+      builder: (bottomSheetContext) {
+        return DraggableScrollableSheet(
+          expand: false,
+          minChildSize: 0.45,
+          initialChildSize: 0.68,
+          maxChildSize: 0.95,
+          builder: (context, scrollController) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(16, 4, 16, 8),
+                  child: Text(
+                    '제목 폰트 선택',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                  ),
+                ),
+                Expanded(
+                  child: ListView.separated(
+                    controller: scrollController,
+                    itemCount: _titleFontOptions.length,
+                    separatorBuilder: (_, index) => const Divider(height: 1),
+                    itemBuilder: (context, index) {
+                      final option = _titleFontOptions[index];
+                      final selected = option.value == _titleFontFamily;
+                      return ListTile(
+                        dense: true,
+                        title: Text(
+                          option.key,
+                          style: TextStyle(
+                            fontFamily: option.value,
+                            fontSize: 15,
+                            fontWeight: selected
+                                ? FontWeight.w700
+                                : FontWeight.w400,
+                          ),
+                        ),
+                        subtitle: Text(
+                          option.value,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        trailing: selected
+                            ? const Icon(Icons.check, size: 18)
+                            : null,
+                        onTap: () =>
+                            Navigator.of(bottomSheetContext).pop(option.value),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (!mounted || pickedFamily == null) {
+      return;
+    }
+
+    setState(() {
+      _titleFontFamily = pickedFamily;
+      _statusMessage = '제목 폰트 변경: $pickedFamily';
     });
   }
 
@@ -396,29 +1189,90 @@ class _ContourRoutePageState extends State<ContourRoutePage> {
     });
   }
 
-  void _toggleMapDecoration(MapDecorationType type) {
+  Offset _defaultLayerPanelOffset(Size mapSize) {
+    final left = math.max(
+      _layerPanelMargin,
+      mapSize.width - _layerPanelWidth - _layerPanelMargin,
+    );
+    return Offset(left, _layerPanelMargin);
+  }
+
+  Offset _clampLayerPanelOffset(Offset offset, Size mapSize) {
+    final maxX = math.max(
+      _layerPanelMargin,
+      mapSize.width - _layerPanelWidth - _layerPanelMargin,
+    );
+    final maxY = math.max(
+      _layerPanelMargin,
+      mapSize.height - _layerPanelHandleHeight - _layerPanelMargin,
+    );
+    return Offset(
+      offset.dx.clamp(_layerPanelMargin, maxX).toDouble(),
+      offset.dy.clamp(_layerPanelMargin, maxY).toDouble(),
+    );
+  }
+
+  Offset _resolvedLayerPanelOffset(Size mapSize) {
+    final offset = _layerPanelOffset ?? _defaultLayerPanelOffset(mapSize);
+    return _clampLayerPanelOffset(offset, mapSize);
+  }
+
+  void _moveLayerPanel(Offset delta, Size mapSize) {
     setState(() {
-      String label;
-      bool visible;
+      final current = _resolvedLayerPanelOffset(mapSize);
+      _layerPanelOffset = _clampLayerPanelOffset(current + delta, mapSize);
+    });
+  }
+
+  String _decorationLabel(MapDecorationType type) {
+    switch (type) {
+      case MapDecorationType.title:
+        return '제목';
+      case MapDecorationType.northArrow:
+        return '방위표';
+      case MapDecorationType.legend:
+        return '범례';
+    }
+  }
+
+  bool _isDecorationVisible(MapDecorationType type) {
+    switch (type) {
+      case MapDecorationType.title:
+        return _showTitleDecoration;
+      case MapDecorationType.northArrow:
+        return _showNorthArrowDecoration;
+      case MapDecorationType.legend:
+        return _showLegendDecoration;
+    }
+  }
+
+  void _setMapDecorationVisible(MapDecorationType type, bool visible) {
+    setState(() {
       switch (type) {
         case MapDecorationType.title:
-          _showTitleDecoration = !_showTitleDecoration;
-          label = '제목';
-          visible = _showTitleDecoration;
+          _showTitleDecoration = visible;
           break;
         case MapDecorationType.northArrow:
-          _showNorthArrowDecoration = !_showNorthArrowDecoration;
-          label = '방위표';
-          visible = _showNorthArrowDecoration;
+          _showNorthArrowDecoration = visible;
           break;
         case MapDecorationType.legend:
-          _showLegendDecoration = !_showLegendDecoration;
-          label = '범례';
-          visible = _showLegendDecoration;
+          _showLegendDecoration = visible;
           break;
       }
+      if (!visible && _selectedLayerId == _decorationLayerId(type)) {
+        _selectedLayerId = '';
+      }
+      final label = _decorationLabel(type);
       _statusMessage = visible ? '$label 표시' : '$label 숨김';
     });
+  }
+
+  void _removeMapDecoration(MapDecorationType type) {
+    _setMapDecorationVisible(type, false);
+  }
+
+  void _toggleMapDecoration(MapDecorationType type) {
+    _setMapDecorationVisible(type, !_isDecorationVisible(type));
   }
 
   Future<void> _editMapTitle() async {
@@ -569,8 +1423,11 @@ class _ContourRoutePageState extends State<ContourRoutePage> {
             ? '이미지 저장 완료(갤러리 포함): $fileName'
             : '이미지 저장 완료(파일만): $fileName';
       });
-      ScaffoldMessenger.of(context).showSnackBar(
+      final successMessenger = ScaffoldMessenger.of(context);
+      successMessenger.hideCurrentSnackBar();
+      final successController = successMessenger.showSnackBar(
         SnackBar(
+          duration: const Duration(seconds: 4),
           content: Text(
             gallerySaved
                 ? 'PNG 저장 완료 · 갤러리에 저장됨'
@@ -593,6 +1450,9 @@ class _ContourRoutePageState extends State<ContourRoutePage> {
           ),
         ),
       );
+      Future<void>.delayed(const Duration(seconds: 5), () {
+        successController.close();
+      });
     } catch (error) {
       if (!mounted) {
         return;
@@ -600,9 +1460,17 @@ class _ContourRoutePageState extends State<ContourRoutePage> {
       setState(() {
         _statusMessage = '이미지 저장 실패: $error';
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('이미지 저장 실패: $error')),
+      final errorMessenger = ScaffoldMessenger.of(context);
+      errorMessenger.hideCurrentSnackBar();
+      final errorController = errorMessenger.showSnackBar(
+        SnackBar(
+          duration: const Duration(seconds: 4),
+          content: Text('이미지 저장 실패: $error'),
+        ),
       );
+      Future<void>.delayed(const Duration(seconds: 5), () {
+        errorController.close();
+      });
     } finally {
       if (mounted) {
         setState(() {
@@ -703,6 +1571,9 @@ class _ContourRoutePageState extends State<ContourRoutePage> {
       final existingLayer = existing;
       setState(() {
         _selectedLayerId = existingLayer.id;
+        _isAddingTrackNote = false;
+        _clearTrackNoteDragState();
+        _clearTrackNoteMoveReady();
         _statusMessage = '이미 추가된 등고선 레이어입니다: ${existingLayer.name}';
       });
       return;
@@ -739,6 +1610,9 @@ class _ContourRoutePageState extends State<ContourRoutePage> {
             )
             .toList(growable: false),
         visible: true,
+        color: _defaultContourColor,
+        width: _defaultContourWidth,
+        opacity: _defaultContourOpacity,
       );
 
       if (!mounted) {
@@ -747,6 +1621,9 @@ class _ContourRoutePageState extends State<ContourRoutePage> {
       setState(() {
         _contourLayers.add(layer);
         _selectedLayerId = layer.id;
+        _isAddingTrackNote = false;
+        _clearTrackNoteDragState();
+        _clearTrackNoteMoveReady();
         _statusMessage =
             '등고선 레이어 추가: ${source.name} (${layer.contours.length}선)';
       });
@@ -788,26 +1665,41 @@ class _ContourRoutePageState extends State<ContourRoutePage> {
             final baseData = snapshot.requireData;
             final world = _worldBounds(baseData);
             final selectedTrack = _selectedTrack();
-            final styleEnabled = selectedTrack != null;
-            final activeColor = selectedTrack?.color ?? _styleColors.first;
-            final activeWidth = selectedTrack?.width ?? 2.2;
-            final activeOpacity = selectedTrack?.opacity ?? 1.0;
-
+            final selectedContour = _selectedContourLayer();
+            final isTitleLayerSelected =
+                _selectedLayerId == _decorationLayerId(MapDecorationType.title);
+            final selectedStyleLayerName =
+                selectedTrack?.name ?? selectedContour?.name ?? '선택된 레이어 없음';
+            final selectedStyleLayerKind =
+                selectedTrack != null
+                    ? 'GPX'
+                    : (selectedContour != null ? '등고선' : '레이어');
+            final styleEnabled = selectedTrack != null || selectedContour != null;
+            final activeColor =
+                selectedTrack?.color ??
+                selectedContour?.color ??
+                _styleColors.first;
+            final activeWidth =
+                selectedTrack?.width ??
+                selectedContour?.width ??
+                _defaultContourWidth;
+            final activeOpacity =
+                selectedTrack?.opacity ??
+                selectedContour?.opacity ??
+                _defaultContourOpacity;
+            final legendIntervals = _legendIntervals();
             return Padding(
               padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
               child: Column(
                 children: [
                   _TopStrip(
                     statusMessage: _statusMessage,
+                    trackEditMode: _isAddingTrackNote,
                     onResetView: () => _resetMapView(world),
                     onExportImage: _exportMapImage,
                     isExportingImage: _isExportingImage,
                     layerPanelVisible: _isLayerPanelVisible,
                     onToggleLayerPanelVisible: _toggleLayerPanelVisible,
-                    titleDecorationVisible: _showTitleDecoration,
-                    northArrowDecorationVisible: _showNorthArrowDecoration,
-                    legendDecorationVisible: _showLegendDecoration,
-                    onToggleDecoration: _toggleMapDecoration,
                   ),
                   const SizedBox(height: 10),
                   Expanded(
@@ -819,142 +1711,256 @@ class _ContourRoutePageState extends State<ContourRoutePage> {
                       ),
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(12),
-                        child: Stack(
-                          children: [
-                            Positioned.fill(
-                              child: RepaintBoundary(
-                                key: _mapCaptureKey,
-                                child: Stack(
-                                  children: [
-                                    Positioned.fill(
-                                      child: LayoutBuilder(
-                                        builder: (context, constraints) {
-                                          return InteractiveViewer(
-                                            transformationController:
-                                                _mapTransformController,
-                                            minScale: _minMapScale,
-                                            maxScale: _maxMapScale,
-                                            panEnabled: true,
-                                            scaleEnabled: true,
-                                            boundaryMargin: const EdgeInsets.all(
-                                              900,
-                                            ),
-                                            child: SizedBox(
-                                              width: constraints.maxWidth,
-                                              height: constraints.maxHeight,
-                                              child: AnimatedBuilder(
-                                                animation: _mapTransformController,
-                                                builder: (context, _) {
-                                                  final currentScale =
-                                                      _mapTransformController
-                                                          .value
-                                                          .getMaxScaleOnAxis();
-                                                  return CustomPaint(
-                                                    painter: OverlayPainter(
-                                                      worldBounds: world,
-                                                      contourLayers:
-                                                          List<
-                                                            ContourLayer
-                                                          >.unmodifiable(
-                                                            _contourLayers,
+                        child: LayoutBuilder(
+                          builder: (context, mapConstraints) {
+                            final layerPanelOffset = _resolvedLayerPanelOffset(
+                              mapConstraints.biggest,
+                            );
+                            return Stack(
+                              children: [
+                                Positioned.fill(
+                                  child: RepaintBoundary(
+                                    key: _mapCaptureKey,
+                                    child: Stack(
+                                      children: [
+                                        Positioned.fill(
+                                          child: LayoutBuilder(
+                                            builder: (context, constraints) {
+                                              return GestureDetector(
+                                                excludeFromSemantics: true,
+                                                behavior: HitTestBehavior.opaque,
+                                                dragStartBehavior: DragStartBehavior.down,
+                                                onTapUp: _isAddingTrackNote
+                                                    ? (details) {
+                                                        _handleMapTapForTrackNote(
+                                                          tapLocalPosition:
+                                                              details.localPosition,
+                                                          canvasSize: Size(
+                                                            constraints.maxWidth,
+                                                            constraints.maxHeight,
                                                           ),
-                                                      tracks:
-                                                          List<
-                                                            TrackLayer
-                                                          >.unmodifiable(_tracks),
-                                                      viewScale: currentScale,
+                                                          worldBounds: world,
+                                                        );
+                                                      }
+                                                    : null,
+                                                onPanStart: _isAddingTrackNote
+                                                    ? (details) {
+                                                        _handleMapPanStartForTrackNote(
+                                                          localPosition:
+                                                              details.localPosition,
+                                                          canvasSize: Size(
+                                                            constraints.maxWidth,
+                                                            constraints.maxHeight,
+                                                          ),
+                                                          worldBounds: world,
+                                                        );
+                                                      }
+                                                    : null,
+                                                onPanUpdate: _isAddingTrackNote
+                                                    ? (details) {
+                                                        _handleMapPanUpdateForTrackNote(
+                                                          localPosition:
+                                                              details.localPosition,
+                                                          canvasSize: Size(
+                                                            constraints.maxWidth,
+                                                            constraints.maxHeight,
+                                                          ),
+                                                          worldBounds: world,
+                                                        );
+                                                      }
+                                                    : null,
+                                                onPanEnd: _isAddingTrackNote
+                                                    ? (_) =>
+                                                          _handleMapPanEndForTrackNote()
+                                                    : null,
+                                                child: InteractiveViewer(
+                                                  transformationController:
+                                                      _mapTransformController,
+                                                  minScale: _minMapScale,
+                                                  maxScale: _maxMapScale,
+                                                  panEnabled: !_isAddingTrackNote,
+                                                  scaleEnabled: !_isAddingTrackNote,
+                                                  boundaryMargin:
+                                                      const EdgeInsets.all(900),
+                                                  child: SizedBox(
+                                                    width: constraints.maxWidth,
+                                                    height: constraints.maxHeight,
+                                                    child: AnimatedBuilder(
+                                                      animation:
+                                                          _mapTransformController,
+                                                      builder: (context, _) {
+                                                        final currentScale =
+                                                            _mapTransformController
+                                                                .value
+                                                                .getMaxScaleOnAxis();
+                                                        return CustomPaint(
+                                                          painter: OverlayPainter(
+                                                            worldBounds: world,
+                                                            contourLayers:
+                                                                List<
+                                                                  ContourLayer
+                                                                >.unmodifiable(
+                                                                  _contourLayers,
+                                                                ),
+                                                            tracks:
+                                                                List<
+                                                                  TrackLayer
+                                                                >.unmodifiable(
+                                                                  _tracks,
+                                                                ),
+                                                            trackNoteFontFamily:
+                                                                _resolvedTrackNoteFontFamily(),
+                                                            viewScale:
+                                                                currentScale,
+                                                          ),
+                                                        );
+                                                      },
                                                     ),
-                                                  );
-                                                },
-                                              ),
-                                            ),
-                                          );
-                                        },
-                                      ),
-                                    ),
-                                    if (_showTitleDecoration)
-                                      Positioned(
-                                        top: 14,
-                                        left: 70,
-                                        right: 70,
-                                        child: _MapTitleBadge(
-                                          text: _mapTitle,
-                                          onTap: _editMapTitle,
-                                        ),
-                                      ),
-                                    if (_showNorthArrowDecoration)
-                                      Positioned(
-                                        top: _showTitleDecoration ? 58 : 14,
-                                        right: 12,
-                                        child: const IgnorePointer(
-                                          child: _NorthArrowBadge(),
-                                        ),
-                                      ),
-                                    if (_showLegendDecoration)
-                                      Positioned(
-                                        left: 12,
-                                        bottom: 12,
-                                        child: IgnorePointer(
-                                          child: _LegendBadge(
-                                            trackColor:
-                                                selectedTrack?.color ??
-                                                const Color(0xFFE74B3C),
+                                                  ),
+                                                ),
+                                              );
+                                            },
                                           ),
                                         ),
-                                      ),
-                                  ],
+                                        if (_showTitleDecoration)
+                                          Positioned(
+                                            top: 14,
+                                            left: 70,
+                                            right: 70,
+                                            child: _MapTitleBadge(
+                                              text: _mapTitle,
+                                              onTap: _editMapTitle,
+                                              color: _titleColor,
+                                              fontSize: _titleFontSize,
+                                              fontFamily: _titleFontFamily,
+                                            ),
+                                          ),
+                                        if (_showNorthArrowDecoration)
+                                          Positioned(
+                                            top: _showTitleDecoration ? 58 : 14,
+                                            right: 12,
+                                            child: const IgnorePointer(
+                                              child: _NorthArrowBadge(),
+                                            ),
+                                          ),
+                                        if (_showLegendDecoration)
+                                          Positioned(
+                                            left: 12,
+                                            bottom: 12,
+                                            child: IgnorePointer(
+                                              child: _LegendBadge(
+                                                trackColor:
+                                                    selectedTrack?.color ??
+                                                    const Color(0xFFE74B3C),
+                                                majorInterval:
+                                                    legendIntervals.majorInterval,
+                                                minorInterval:
+                                                    legendIntervals.minorInterval,
+                                              ),
+                                            ),
+                                          ),
+                                      ],
+                                    ),
+                                  ),
                                 ),
-                              ),
-                            ),
-                            Positioned(
-                              left: 12,
-                              top: 12,
-                              child: _LeftTools(
-                                isLoadingContour:
-                                    _isLoadingContourSources ||
-                                    _isLoadingContourLayer,
-                                onAddContourLayer: _showContourSourcePicker,
-                                isLoadingRoute: _isLoadingRoute,
-                                onPickGpx: _pickRouteFromGpx,
-                              ),
-                            ),
-                            if (_isLayerPanelVisible)
-                              Positioned(
-                                right: 12,
-                                top: 12,
-                                child: _LayerPanel(
-                                  contourLayers: _contourLayers,
-                                  selectedLayerId: _selectedLayerId,
-                                  tracks: _tracks,
-                                  onSelectLayer: (id) {
-                                    setState(() {
-                                      _selectedLayerId = id;
-                                    });
-                                  },
-                                  onExtraContourVisibleChanged:
-                                      _setExtraContourVisible,
-                                  onTrackVisibleChanged: _setTrackVisible,
-                                  onRemoveContourLayer: _removeContourLayer,
-                                  onRemoveTrack: _removeTrack,
+                                Positioned(
+                                  left: 12,
+                                  top: 12,
+                                  child: _LeftTools(
+                                    isLoadingContour:
+                                        _isLoadingContourSources ||
+                                        _isLoadingContourLayer,
+                                    onAddContourLayer: _showContourSourcePicker,
+                                    isLoadingRoute: _isLoadingRoute,
+                                    onPickGpx: _pickRouteFromGpx,
+                                    titleDecorationVisible: _showTitleDecoration,
+                                    northArrowDecorationVisible:
+                                        _showNorthArrowDecoration,
+                                    legendDecorationVisible:
+                                        _showLegendDecoration,
+                                    onToggleDecoration: _toggleMapDecoration,
+                                  ),
                                 ),
-                              ),
-                          ],
+                                if (_isLayerPanelVisible)
+                                  Positioned(
+                                    left: layerPanelOffset.dx,
+                                    top: layerPanelOffset.dy,
+                                    child: _LayerPanel(
+                                      contourLayers: _contourLayers,
+                                      selectedLayerId: _selectedLayerId,
+                                      tracks: _tracks,
+                                      titleDecorationVisible:
+                                          _showTitleDecoration,
+                                      northArrowDecorationVisible:
+                                          _showNorthArrowDecoration,
+                                      legendDecorationVisible:
+                                          _showLegendDecoration,
+                                      onDecorationVisibleChanged:
+                                          _setMapDecorationVisible,
+                                      onRemoveDecoration: _removeMapDecoration,
+                                      onClose: _toggleLayerPanelVisible,
+                                      onHeaderDragUpdate: (details) =>
+                                          _moveLayerPanel(
+                                            details.delta,
+                                            mapConstraints.biggest,
+                                          ),
+                                      onSelectLayer: (id) {
+                                        setState(() {
+                                          _selectedLayerId = id;
+                                          if (!_tracks.any(
+                                            (track) => track.id == id,
+                                          )) {
+                                            _isAddingTrackNote = false;
+                                            _clearTrackNoteDragState();
+                                            _clearTrackNoteMoveReady();
+                                          }
+                                        });
+                                      },
+                                      onExtraContourVisibleChanged:
+                                          _setExtraContourVisible,
+                                      onTrackVisibleChanged: _setTrackVisible,
+                                      onTrackNoteVisibleChanged:
+                                          _setTrackNoteVisible,
+                                      onRemoveContourLayer: _removeContourLayer,
+                                      onRemoveTrack: _removeTrack,
+                                      onRemoveTrackNote: _removeTrackNote,
+                                    ),
+                                  ),
+                              ],
+                            );
+                          },
                         ),
                       ),
                     ),
                   ),
                   const SizedBox(height: 10),
-                  _StylePanel(
-                    activeLayerName: selectedTrack?.name ?? '선택된 GPX 없음',
-                    enabled: styleEnabled,
-                    selectedColor: activeColor,
-                    selectedWidth: activeWidth,
-                    selectedOpacity: activeOpacity,
-                    colorChoices: _styleColors,
-                    onColorChanged: _updateSelectedColor,
-                    onWidthChanged: _updateSelectedWidth,
-                    onOpacityChanged: _updateSelectedOpacity,
-                  ),
+                  if (isTitleLayerSelected)
+                    _TitleStylePanel(
+                      titleText: _mapTitle,
+                      selectedColor: _titleColor,
+                      selectedFontSize: _titleFontSize,
+                      selectedFontFamily: _titleFontFamily,
+                      colorChoices: _styleColors,
+                      onColorChanged: _updateTitleColor,
+                      onFontSizeChanged: _updateTitleFontSize,
+                      onOpenFontPicker: _showTitleFontPicker,
+                    )
+                  else
+                    _StylePanel(
+                      activeLayerName: selectedStyleLayerName,
+                      activeLayerKind: selectedStyleLayerKind,
+                      isTrackLayerSelected: selectedTrack != null,
+                      trackNoteMode: _isAddingTrackNote,
+                      onToggleTrackNoteMode: _toggleTrackNoteMode,
+                      enabled: styleEnabled,
+                      selectedColor: activeColor,
+                      selectedWidth: activeWidth,
+                      selectedOpacity: activeOpacity,
+                      colorChoices: _styleColors,
+                      onColorChanged: _updateSelectedColor,
+                      onWidthChanged: _updateSelectedWidth,
+                      onOpacityChanged: _updateSelectedOpacity,
+                    ),
                 ],
               ),
             );
@@ -968,30 +1974,33 @@ class _ContourRoutePageState extends State<ContourRoutePage> {
 class _TopStrip extends StatelessWidget {
   const _TopStrip({
     required this.statusMessage,
+    required this.trackEditMode,
     required this.onResetView,
     required this.onExportImage,
     required this.isExportingImage,
     required this.layerPanelVisible,
     required this.onToggleLayerPanelVisible,
-    required this.titleDecorationVisible,
-    required this.northArrowDecorationVisible,
-    required this.legendDecorationVisible,
-    required this.onToggleDecoration,
   });
 
   final String? statusMessage;
+  final bool trackEditMode;
   final VoidCallback onResetView;
   final VoidCallback onExportImage;
   final bool isExportingImage;
   final bool layerPanelVisible;
   final VoidCallback onToggleLayerPanelVisible;
-  final bool titleDecorationVisible;
-  final bool northArrowDecorationVisible;
-  final bool legendDecorationVisible;
-  final ValueChanged<MapDecorationType> onToggleDecoration;
 
   @override
   Widget build(BuildContext context) {
+    final titleText = trackEditMode ? '경로 편집 모드' : '등고선 편집기';
+    final titleStyle = trackEditMode
+        ? const TextStyle(
+            fontSize: 20,
+            fontWeight: FontWeight.w800,
+            letterSpacing: -0.2,
+            color: Color(0xFF1D2A24),
+          )
+        : Theme.of(context).textTheme.titleSmall;
     return Container(
       height: 44,
       padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -1004,35 +2013,13 @@ class _TopStrip extends StatelessWidget {
           const Icon(Icons.terrain, size: 18),
           const SizedBox(width: 8),
           Tooltip(
-            message: statusMessage ?? '등고선 편집기',
+            message: statusMessage ?? titleText,
             child: Text(
-              '등고선 편집기',
-              style: Theme.of(context).textTheme.titleSmall,
+              titleText,
+              style: titleStyle,
             ),
           ),
           const Spacer(),
-          PopupMenuButton<MapDecorationType>(
-            tooltip: '아이콘 추가',
-            onSelected: onToggleDecoration,
-            itemBuilder: (context) => [
-              CheckedPopupMenuItem<MapDecorationType>(
-                value: MapDecorationType.title,
-                checked: titleDecorationVisible,
-                child: const Text('제목'),
-              ),
-              CheckedPopupMenuItem<MapDecorationType>(
-                value: MapDecorationType.northArrow,
-                checked: northArrowDecorationVisible,
-                child: const Text('방위표'),
-              ),
-              CheckedPopupMenuItem<MapDecorationType>(
-                value: MapDecorationType.legend,
-                checked: legendDecorationVisible,
-                child: const Text('범례'),
-              ),
-            ],
-            icon: const Icon(Icons.add_circle_outline, size: 18),
-          ),
           IconButton(
             tooltip: layerPanelVisible ? '레이어 패널 숨기기' : '레이어 패널 보기',
             onPressed: onToggleLayerPanelVisible,
@@ -1066,9 +2053,18 @@ class _TopStrip extends StatelessWidget {
 }
 
 class _MapTitleBadge extends StatelessWidget {
-  const _MapTitleBadge({required this.text, this.onTap});
+  const _MapTitleBadge({
+    required this.text,
+    required this.color,
+    required this.fontSize,
+    required this.fontFamily,
+    this.onTap,
+  });
 
   final String text;
+  final Color color;
+  final double fontSize;
+  final String fontFamily;
   final VoidCallback? onTap;
 
   @override
@@ -1085,13 +2081,13 @@ class _MapTitleBadge extends StatelessWidget {
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             textAlign: TextAlign.center,
-            style: const TextStyle(
-              fontSize: 28,
+            style: TextStyle(
+              fontSize: fontSize,
               height: 1.05,
-              fontFamily: 'serif',
+              fontFamily: fontFamily,
               fontWeight: FontWeight.w600,
               letterSpacing: 0.2,
-              color: Color(0xFF1F2A24),
+              color: color,
             ),
           ),
         ),
@@ -1124,10 +2120,26 @@ class _NorthArrowBadge extends StatelessWidget {
   }
 }
 
+class _LegendIntervals {
+  const _LegendIntervals({
+    required this.majorInterval,
+    required this.minorInterval,
+  });
+
+  final int majorInterval;
+  final int minorInterval;
+}
+
 class _LegendBadge extends StatelessWidget {
-  const _LegendBadge({required this.trackColor});
+  const _LegendBadge({
+    required this.trackColor,
+    required this.majorInterval,
+    required this.minorInterval,
+  });
 
   final Color trackColor;
+  final int majorInterval;
+  final int minorInterval;
 
   @override
   Widget build(BuildContext context) {
@@ -1149,13 +2161,13 @@ class _LegendBadge extends StatelessWidget {
           ),
           const SizedBox(height: 6),
           _LegendRow(
-            label: '주곡선',
+            label: '주곡선 (${majorInterval}m 간격)',
             lineColor: const Color(0xFF4B6256).withAlpha(190),
             thickness: 2.0,
           ),
           const SizedBox(height: 3),
           _LegendRow(
-            label: '보조곡선',
+            label: '보조곡선 (${minorInterval}m 간격)',
             lineColor: const Color(0xFF60766A).withAlpha(130),
             thickness: 1.2,
           ),
@@ -1203,12 +2215,20 @@ class _LeftTools extends StatelessWidget {
     required this.onAddContourLayer,
     required this.isLoadingRoute,
     required this.onPickGpx,
+    required this.titleDecorationVisible,
+    required this.northArrowDecorationVisible,
+    required this.legendDecorationVisible,
+    required this.onToggleDecoration,
   });
 
   final bool isLoadingContour;
   final VoidCallback onAddContourLayer;
   final bool isLoadingRoute;
   final VoidCallback onPickGpx;
+  final bool titleDecorationVisible;
+  final bool northArrowDecorationVisible;
+  final bool legendDecorationVisible;
+  final ValueChanged<MapDecorationType> onToggleDecoration;
 
   @override
   Widget build(BuildContext context) {
@@ -1225,7 +2245,66 @@ class _LeftTools extends StatelessWidget {
           onTap: isLoadingRoute ? null : onPickGpx,
           tooltip: '내 트랙 가져오기',
         ),
+        const SizedBox(height: 8),
+        _DecorationToolButton(
+          titleDecorationVisible: titleDecorationVisible,
+          northArrowDecorationVisible: northArrowDecorationVisible,
+          legendDecorationVisible: legendDecorationVisible,
+          onToggleDecoration: onToggleDecoration,
+        ),
       ],
+    );
+  }
+}
+
+class _DecorationToolButton extends StatelessWidget {
+  const _DecorationToolButton({
+    required this.titleDecorationVisible,
+    required this.northArrowDecorationVisible,
+    required this.legendDecorationVisible,
+    required this.onToggleDecoration,
+  });
+
+  final bool titleDecorationVisible;
+  final bool northArrowDecorationVisible;
+  final bool legendDecorationVisible;
+  final ValueChanged<MapDecorationType> onToggleDecoration;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.white.withAlpha(235),
+      borderRadius: BorderRadius.circular(8),
+      child: Tooltip(
+        message: '제목/방위표/범례 추가',
+        child: SizedBox(
+          width: 38,
+          height: 38,
+          child: PopupMenuButton<MapDecorationType>(
+            onSelected: onToggleDecoration,
+            itemBuilder: (context) => [
+              CheckedPopupMenuItem<MapDecorationType>(
+                value: MapDecorationType.title,
+                checked: titleDecorationVisible,
+                child: const Text('제목'),
+              ),
+              CheckedPopupMenuItem<MapDecorationType>(
+                value: MapDecorationType.northArrow,
+                checked: northArrowDecorationVisible,
+                child: const Text('방위표'),
+              ),
+              CheckedPopupMenuItem<MapDecorationType>(
+                value: MapDecorationType.legend,
+                checked: legendDecorationVisible,
+                child: const Text('범례'),
+              ),
+            ],
+            padding: EdgeInsets.zero,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            child: const Icon(Icons.add_reaction_outlined, size: 19),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -1263,24 +2342,48 @@ class _LayerPanel extends StatelessWidget {
     required this.contourLayers,
     required this.selectedLayerId,
     required this.tracks,
+    required this.titleDecorationVisible,
+    required this.northArrowDecorationVisible,
+    required this.legendDecorationVisible,
+    required this.onDecorationVisibleChanged,
+    required this.onRemoveDecoration,
+    required this.onClose,
+    required this.onHeaderDragUpdate,
     required this.onSelectLayer,
     required this.onExtraContourVisibleChanged,
     required this.onTrackVisibleChanged,
+    required this.onTrackNoteVisibleChanged,
     required this.onRemoveContourLayer,
     required this.onRemoveTrack,
+    required this.onRemoveTrackNote,
   });
 
   final List<ContourLayer> contourLayers;
   final String selectedLayerId;
   final List<TrackLayer> tracks;
+  final bool titleDecorationVisible;
+  final bool northArrowDecorationVisible;
+  final bool legendDecorationVisible;
+  final void Function(MapDecorationType, bool) onDecorationVisibleChanged;
+  final ValueChanged<MapDecorationType> onRemoveDecoration;
+  final VoidCallback onClose;
+  final GestureDragUpdateCallback onHeaderDragUpdate;
   final ValueChanged<String> onSelectLayer;
   final void Function(String, bool) onExtraContourVisibleChanged;
   final void Function(String, bool) onTrackVisibleChanged;
+  final void Function(String, String, bool) onTrackNoteVisibleChanged;
   final ValueChanged<String> onRemoveContourLayer;
   final ValueChanged<String> onRemoveTrack;
+  final void Function(String, String) onRemoveTrackNote;
 
   @override
   Widget build(BuildContext context) {
+    final hasDecorationLayers =
+        titleDecorationVisible ||
+        northArrowDecorationVisible ||
+        legendDecorationVisible;
+    final hasDataLayers = contourLayers.isNotEmpty || tracks.isNotEmpty;
+
     return Container(
       width: 210,
       padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
@@ -1293,17 +2396,65 @@ class _LayerPanel extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              const Expanded(
-                child: Text(
-                  '레이어',
-                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+          GestureDetector(
+            onPanUpdate: onHeaderDragUpdate,
+            behavior: HitTestBehavior.opaque,
+            child: Row(
+              children: [
+                const Icon(Icons.drag_indicator, size: 16, color: Color(0xFF718179)),
+                const SizedBox(width: 4),
+                const Expanded(
+                  child: Text(
+                    '레이어',
+                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+                  ),
                 ),
-              ),
-            ],
+                IconButton(
+                  tooltip: '레이어 패널 닫기',
+                  onPressed: onClose,
+                  icon: const Icon(Icons.close, size: 16),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ],
+            ),
           ),
-          const SizedBox(height: 2),
+          if (hasDecorationLayers) const SizedBox(height: 2),
+          if (titleDecorationVisible)
+            _LayerTile(
+              label: '제목',
+              visible: titleDecorationVisible,
+              selected:
+                  selectedLayerId == _decorationLayerId(MapDecorationType.title),
+              onTap: () => onSelectLayer(_decorationLayerId(MapDecorationType.title)),
+              onVisibleChanged: (value) =>
+                  onDecorationVisibleChanged(MapDecorationType.title, value),
+              onRemove: () => onRemoveDecoration(MapDecorationType.title),
+            ),
+          if (northArrowDecorationVisible)
+            _LayerTile(
+              label: '방위표',
+              visible: northArrowDecorationVisible,
+              selected: selectedLayerId ==
+                  _decorationLayerId(MapDecorationType.northArrow),
+              onTap: () =>
+                  onSelectLayer(_decorationLayerId(MapDecorationType.northArrow)),
+              onVisibleChanged: (value) =>
+                  onDecorationVisibleChanged(MapDecorationType.northArrow, value),
+              onRemove: () => onRemoveDecoration(MapDecorationType.northArrow),
+            ),
+          if (legendDecorationVisible)
+            _LayerTile(
+              label: '범례',
+              visible: legendDecorationVisible,
+              selected:
+                  selectedLayerId == _decorationLayerId(MapDecorationType.legend),
+              onTap: () =>
+                  onSelectLayer(_decorationLayerId(MapDecorationType.legend)),
+              onVisibleChanged: (value) =>
+                  onDecorationVisibleChanged(MapDecorationType.legend, value),
+              onRemove: () => onRemoveDecoration(MapDecorationType.legend),
+            ),
+          if (hasDecorationLayers && hasDataLayers) const SizedBox(height: 2),
           ...contourLayers.map(
             (contourLayer) => _LayerTile(
               label: contourLayer.name,
@@ -1315,8 +2466,8 @@ class _LayerPanel extends StatelessWidget {
               onRemove: () => onRemoveContourLayer(contourLayer.id),
             ),
           ),
-          ...tracks.map(
-            (track) => _LayerTile(
+          ...tracks.expand((track) sync* {
+            yield _LayerTile(
               label: track.name,
               visible: track.visible,
               selected: selectedLayerId == track.id,
@@ -1324,8 +2475,18 @@ class _LayerPanel extends StatelessWidget {
               onVisibleChanged: (value) =>
                   onTrackVisibleChanged(track.id, value),
               onRemove: () => onRemoveTrack(track.id),
-            ),
-          ),
+            );
+            for (final note in track.notes) {
+              yield _LayerSubTile(
+                label: note.text,
+                visible: note.isVisible,
+                onTap: () => onSelectLayer(track.id),
+                onVisibleChanged: (value) =>
+                    onTrackNoteVisibleChanged(track.id, note.id, value),
+                onRemove: () => onRemoveTrackNote(track.id, note.id),
+              );
+            }
+          }),
         ],
       ),
     );
@@ -1390,9 +2551,215 @@ class _LayerTile extends StatelessWidget {
   }
 }
 
+class _LayerSubTile extends StatelessWidget {
+  const _LayerSubTile({
+    required this.label,
+    required this.visible,
+    required this.onTap,
+    required this.onVisibleChanged,
+    this.onRemove,
+  });
+
+  final String label;
+  final bool visible;
+  final VoidCallback onTap;
+  final ValueChanged<bool> onVisibleChanged;
+  final VoidCallback? onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 24),
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(6),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(6),
+          child: SizedBox(
+            height: 28,
+            child: Row(
+              children: [
+                Checkbox(
+                  value: visible,
+                  onChanged: (value) => onVisibleChanged(value ?? false),
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  visualDensity: VisualDensity.compact,
+                ),
+                const Icon(Icons.place_outlined, size: 12, color: Color(0xFF6C7D74)),
+                const SizedBox(width: 4),
+                Expanded(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 11, color: Color(0xFF33443C)),
+                  ),
+                ),
+                if (onRemove != null)
+                  IconButton(
+                    tooltip: '포인트 삭제',
+                    onPressed: onRemove,
+                    icon: const Icon(Icons.delete_outline, size: 14),
+                    visualDensity: VisualDensity.compact,
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _TitleStylePanel extends StatelessWidget {
+  const _TitleStylePanel({
+    required this.titleText,
+    required this.selectedColor,
+    required this.selectedFontSize,
+    required this.selectedFontFamily,
+    required this.colorChoices,
+    required this.onColorChanged,
+    required this.onFontSizeChanged,
+    required this.onOpenFontPicker,
+  });
+
+  final String titleText;
+  final Color selectedColor;
+  final double selectedFontSize;
+  final String selectedFontFamily;
+  final List<Color> colorChoices;
+  final ValueChanged<Color> onColorChanged;
+  final ValueChanged<double> onFontSizeChanged;
+  final VoidCallback onOpenFontPicker;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 128,
+      padding: const EdgeInsets.fromLTRB(8, 8, 8, 6),
+      decoration: BoxDecoration(
+        color: const Color(0xFFE8EEEA),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '제목 스타일: $titleText',
+            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 2),
+          const Text(
+            '선택한 제목 레이어에 적용됩니다.',
+            style: TextStyle(fontSize: 10, color: Color(0xFF5A6A62)),
+          ),
+          Text(
+            '현재 폰트: $selectedFontFamily',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 10, color: Color(0xFF5A6A62)),
+          ),
+          const SizedBox(height: 6),
+          Expanded(
+            child: Row(
+              children: [
+                Expanded(
+                  child: _StyleCell(
+                    title: '색상',
+                    child: Wrap(
+                      spacing: 6,
+                      runSpacing: 4,
+                      children: colorChoices
+                          .map(
+                            (color) => GestureDetector(
+                              onTap: () => onColorChanged(color),
+                              child: Container(
+                                width: 18,
+                                height: 18,
+                                decoration: BoxDecoration(
+                                  color: color,
+                                  shape: BoxShape.circle,
+                                  border: Border.all(
+                                    color: color.toARGB32() ==
+                                            selectedColor.toARGB32()
+                                        ? Colors.black
+                                        : Colors.white,
+                                    width: 1.5,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          )
+                          .toList(),
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: _StyleCell(
+                    title: '글씨 크기',
+                    child: Slider(
+                      value: selectedFontSize.clamp(12, 56),
+                      min: 12,
+                      max: 56,
+                      onChanged: onFontSizeChanged,
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: _StyleCell(
+                    title: '폰트',
+                    trailing: TextButton(
+                      onPressed: onOpenFontPicker,
+                      style: TextButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 0,
+                        ),
+                        minimumSize: const Size(0, 22),
+                      ),
+                      child: const Text('선택', style: TextStyle(fontSize: 10)),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: SingleChildScrollView(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '선택: $selectedFontFamily',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 10,
+                                color: const Color(0xFF4E5E56),
+                                fontFamily: selectedFontFamily,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _StylePanel extends StatelessWidget {
   const _StylePanel({
     required this.activeLayerName,
+    required this.activeLayerKind,
+    required this.isTrackLayerSelected,
+    required this.trackNoteMode,
+    required this.onToggleTrackNoteMode,
     required this.enabled,
     required this.selectedColor,
     required this.selectedWidth,
@@ -1404,6 +2771,10 @@ class _StylePanel extends StatelessWidget {
   });
 
   final String activeLayerName;
+  final String activeLayerKind;
+  final bool isTrackLayerSelected;
+  final bool trackNoteMode;
+  final VoidCallback onToggleTrackNoteMode;
   final bool enabled;
   final Color selectedColor;
   final double selectedWidth;
@@ -1416,7 +2787,7 @@ class _StylePanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      height: 116,
+      height: isTrackLayerSelected ? 136 : 102,
       padding: const EdgeInsets.fromLTRB(8, 8, 8, 6),
       decoration: BoxDecoration(
         color: const Color(0xFFE8EEEA),
@@ -1425,16 +2796,46 @@ class _StylePanel extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            'GPX 스타일: $activeLayerName',
-            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-          ),
-          const SizedBox(height: 2),
-          Text(
-            enabled ? '현재 선택한 GPX 경로에 적용됩니다.' : '레이어에서 GPX 트랙을 선택하면 적용됩니다.',
-            style: const TextStyle(fontSize: 10, color: Color(0xFF5A6A62)),
-          ),
-          const SizedBox(height: 6),
+          if (isTrackLayerSelected)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: SizedBox(
+                width: 168,
+                height: 22,
+                child: OutlinedButton.icon(
+                  onPressed: onToggleTrackNoteMode,
+                  icon: Icon(
+                    trackNoteMode
+                        ? Icons.edit_location_alt
+                        : Icons.edit_location_outlined,
+                    size: 12,
+                  ),
+                  label: Text(
+                    trackNoteMode ? '경로 편집 모드 OFF' : '경로 편집 모드 ON',
+                    style: const TextStyle(fontSize: 9.5),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 0),
+                    side: BorderSide(
+                      color: trackNoteMode
+                          ? const Color(0xFF1E7E55)
+                          : const Color(0xFF8CA095),
+                      width: 1,
+                    ),
+                    backgroundColor: trackNoteMode
+                        ? const Color(0xFFDDECE4)
+                        : Colors.white.withAlpha(220),
+                    foregroundColor: const Color(0xFF23322B),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          if (isTrackLayerSelected) const SizedBox(height: 4),
           Expanded(
             child: Row(
               children: [
@@ -1504,10 +2905,11 @@ class _StylePanel extends StatelessWidget {
 }
 
 class _StyleCell extends StatelessWidget {
-  const _StyleCell({required this.title, required this.child});
+  const _StyleCell({required this.title, required this.child, this.trailing});
 
   final String title;
   final Widget child;
+  final Widget? trailing;
 
   @override
   Widget build(BuildContext context) {
@@ -1521,7 +2923,19 @@ class _StyleCell extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(title, style: const TextStyle(fontSize: 11)),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 11),
+                ),
+              ),
+              ?trailing,
+            ],
+          ),
           Expanded(child: child),
         ],
       ),
@@ -1534,12 +2948,14 @@ class OverlayPainter extends CustomPainter {
     required this.worldBounds,
     required this.contourLayers,
     required this.tracks,
+    required this.trackNoteFontFamily,
     required this.viewScale,
   });
 
   final Rect worldBounds;
   final List<ContourLayer> contourLayers;
   final List<TrackLayer> tracks;
+  final String trackNoteFontFamily;
   final double viewScale;
 
   @override
@@ -1567,22 +2983,26 @@ class OverlayPainter extends CustomPainter {
     }
 
     final contourInterval = _contourIntervalForScale(contourRenderScale);
-    final contourMinorWidth = zoomAdjustedContourStroke(0.18);
-    final contourMajorWidth = zoomAdjustedContourStroke(0.30);
-    final extraMinorPaint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = contourMinorWidth
-      ..strokeCap = StrokeCap.butt
-      ..strokeJoin = StrokeJoin.bevel
-      ..color = const Color(0xFF60766A).withAlpha(72);
-    final extraMajorPaint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = contourMajorWidth
-      ..strokeCap = StrokeCap.butt
-      ..strokeJoin = StrokeJoin.bevel
-      ..color = const Color(0xFF4B6256).withAlpha(118);
-
     for (final layer in contourLayers.where((layer) => layer.visible)) {
+      final layerWidth = layer.width.clamp(0.3, 6.0);
+      final layerOpacity = layer.opacity.clamp(0.0, 1.0);
+      final minorBase = 0.08 * layerWidth;
+      final majorBase = 0.14 * layerWidth;
+      final minorAlpha = (255 * layerOpacity * 0.75).round().clamp(0, 255);
+      final majorAlpha = (255 * layerOpacity).round().clamp(0, 255);
+      final extraMinorPaint = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = zoomAdjustedContourStroke(minorBase)
+        ..strokeCap = StrokeCap.butt
+        ..strokeJoin = StrokeJoin.bevel
+        ..color = layer.color.withAlpha(minorAlpha);
+      final extraMajorPaint = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = zoomAdjustedContourStroke(majorBase)
+        ..strokeCap = StrokeCap.butt
+        ..strokeJoin = StrokeJoin.bevel
+        ..color = layer.color.withAlpha(majorAlpha);
+
       for (final contour in layer.contours) {
         if (!_shouldDrawContour(contour, contourInterval)) {
           continue;
@@ -1627,6 +3047,39 @@ class OverlayPainter extends CustomPainter {
           end,
           markerRadius,
           Paint()..color = const Color(0xFFC7292D),
+        );
+      }
+
+      for (final note in track.notes) {
+        if (!note.isVisible) {
+          continue;
+        }
+        final markerCenter = projector.toCanvas(note.point);
+        final markerRadius = zoomAdjustedRadius(1.8);
+        final markerFill = Paint()..color = Colors.white.withAlpha(235);
+        final markerStroke = Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.0
+          ..color = track.color.withAlpha(220);
+        canvas.drawCircle(markerCenter, markerRadius + 0.6, markerFill);
+        canvas.drawCircle(markerCenter, markerRadius + 0.6, markerStroke);
+
+        final labelLayout = _buildTrackNoteLabelLayout(
+          note: note,
+          projector: projector,
+          fontFamily: trackNoteFontFamily,
+        );
+        final leaderStroke = zoomAdjustedStroke(0.35).clamp(0.3, 1.0);
+        final leaderPaint = Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeCap = StrokeCap.round
+          ..strokeWidth = leaderStroke
+          ..color = track.color.withAlpha(145);
+        canvas.drawLine(markerCenter, labelLayout.rect.center, leaderPaint);
+
+        labelLayout.textPainter.paint(
+          canvas,
+          Offset(labelLayout.rect.left + 3, labelLayout.rect.top + 2),
         );
       }
     }
@@ -1685,8 +3138,50 @@ class OverlayPainter extends CustomPainter {
     return oldDelegate.worldBounds != worldBounds ||
         oldDelegate.contourLayers != contourLayers ||
         oldDelegate.tracks != tracks ||
+        oldDelegate.trackNoteFontFamily != trackNoteFontFamily ||
         oldDelegate.viewScale != viewScale;
   }
+}
+
+class _TrackNoteLabelLayout {
+  const _TrackNoteLabelLayout({
+    required this.rect,
+    required this.textPainter,
+  });
+
+  final Rect rect;
+  final TextPainter textPainter;
+}
+
+_TrackNoteLabelLayout _buildTrackNoteLabelLayout({
+  required TrackNote note,
+  required _Projector projector,
+  required String fontFamily,
+}) {
+  final textPainter = TextPainter(
+    text: TextSpan(
+      text: note.text,
+      style: TextStyle(
+        fontSize: 10,
+        fontWeight: FontWeight.w600,
+        color: const Color(0xFF22302A),
+        fontFamily: fontFamily,
+        fontFamilyFallback: const ['Noto Sans KR'],
+      ),
+    ),
+    textDirection: TextDirection.ltr,
+    maxLines: 1,
+    ellipsis: '…',
+  )..layout(maxWidth: 120);
+
+  final labelCenter = projector.toCanvas(note.point + note.labelOffset);
+  final labelRect = Rect.fromCenter(
+    center: labelCenter,
+    width: textPainter.width + 6,
+    height: textPainter.height + 4,
+  );
+
+  return _TrackNoteLabelLayout(rect: labelRect, textPainter: textPainter);
 }
 
 class _Projector {
@@ -1711,6 +3206,12 @@ class _Projector {
   Offset toCanvas(Offset worldPoint) {
     final x = leftPad + (worldPoint.dx - world.left) * scale;
     final y = topPad + (world.bottom - worldPoint.dy) * scale;
+    return Offset(x, y);
+  }
+
+  Offset toWorld(Offset canvasPoint) {
+    final x = world.left + (canvasPoint.dx - leftPad) / scale;
+    final y = world.bottom - (canvasPoint.dy - topPad) / scale;
     return Offset(x, y);
   }
 }
@@ -1777,6 +3278,9 @@ class ContourLayer {
     required this.bounds,
     required this.contours,
     required this.visible,
+    required this.color,
+    required this.width,
+    required this.opacity,
   });
 
   final String id;
@@ -1785,6 +3289,9 @@ class ContourLayer {
   final Rect bounds;
   final List<ContourLine> contours;
   final bool visible;
+  final Color color;
+  final double width;
+  final double opacity;
 
   ContourLayer copyWith({
     String? id,
@@ -1793,6 +3300,9 @@ class ContourLayer {
     Rect? bounds,
     List<ContourLine>? contours,
     bool? visible,
+    Color? color,
+    double? width,
+    double? opacity,
   }) {
     return ContourLayer(
       id: id ?? this.id,
@@ -1801,6 +3311,9 @@ class ContourLayer {
       bounds: bounds ?? this.bounds,
       contours: contours ?? this.contours,
       visible: visible ?? this.visible,
+      color: color ?? this.color,
+      width: width ?? this.width,
+      opacity: opacity ?? this.opacity,
     );
   }
 }
@@ -1810,6 +3323,7 @@ class TrackLayer {
     required this.id,
     required this.name,
     required this.lines,
+    this.notes = const [],
     required this.visible,
     required this.color,
     required this.width,
@@ -1819,6 +3333,7 @@ class TrackLayer {
   final String id;
   final String name;
   final List<List<Offset>> lines;
+  final List<TrackNote> notes;
   final bool visible;
   final Color color;
   final double width;
@@ -1828,6 +3343,7 @@ class TrackLayer {
     String? id,
     String? name,
     List<List<Offset>>? lines,
+    List<TrackNote>? notes,
     bool? visible,
     Color? color,
     double? width,
@@ -1837,10 +3353,81 @@ class TrackLayer {
       id: id ?? this.id,
       name: name ?? this.name,
       lines: lines ?? this.lines,
+      notes: notes ?? this.notes,
       visible: visible ?? this.visible,
       color: color ?? this.color,
       width: width ?? this.width,
       opacity: opacity ?? this.opacity,
     );
   }
+}
+
+class TrackNote {
+  const TrackNote({
+    required this.id,
+    required this.point,
+    required this.text,
+    this.labelOffset = Offset.zero,
+    this.visible = true,
+  });
+
+  final String id;
+  final Offset point;
+  final String text;
+  final Offset labelOffset;
+  final bool? visible;
+  bool get isVisible => visible ?? true;
+
+  TrackNote copyWith({
+    String? id,
+    Offset? point,
+    String? text,
+    Offset? labelOffset,
+    bool? visible,
+  }) {
+    return TrackNote(
+      id: id ?? this.id,
+      point: point ?? this.point,
+      text: text ?? this.text,
+      labelOffset: labelOffset ?? this.labelOffset,
+      visible: visible ?? this.visible ?? true,
+    );
+  }
+}
+
+class _NearestTrackPoint {
+  const _NearestTrackPoint({
+    required this.worldPoint,
+    required this.distancePx,
+  });
+
+  final Offset worldPoint;
+  final double distancePx;
+}
+
+class _NearestTrackNote {
+  const _NearestTrackNote({
+    required this.note,
+    required this.distancePx,
+    required this.hitTarget,
+  });
+
+  final TrackNote note;
+  final double distancePx;
+  final _TrackNoteHitTarget hitTarget;
+}
+
+enum _TrackNoteAction {
+  edit,
+  moveText,
+  delete,
+}
+
+enum _TrackNoteHitTarget {
+  marker,
+  label,
+}
+
+enum _TrackNoteDragTarget {
+  label,
 }
